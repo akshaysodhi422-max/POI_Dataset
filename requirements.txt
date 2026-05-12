@@ -12,3 +12,4 @@ lxml
 geopandas
 shapely
 pyarrow
+wikipedia-api

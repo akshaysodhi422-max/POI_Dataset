@@ -27,6 +27,31 @@ SELECT ?place ?placeLabel ?coord ?image ?countryLabel ?article (COUNT(?sitelink)
   }
 }
 GROUP BY ?place ?placeLabel ?coord ?image ?countryLabel ?article
+HAVING (COUNT(?sitelink) > 10)
+ORDER BY DESC(?sitelinks)
+LIMIT %s
+OFFSET %s
+"""
+
+# Peaks-specific query — avoids expensive hierarchy traversal and COUNT aggregation
+PEAKS_QUERY_TEMPLATE = """
+SELECT ?place ?placeLabel ?coord ?image ?countryLabel ?article ?sitelinks WHERE {
+  ?place wdt:P31 wd:Q8502.
+  ?place wdt:P625 ?coord.
+  ?place wdt:P18 ?image.
+  ?place wikibase:sitelinks ?sitelinks.
+  FILTER(?sitelinks > 20)
+
+  OPTIONAL { ?place wdt:P17 ?country. }
+  OPTIONAL {
+    ?article schema:about ?place ;
+             schema:isPartOf <https://en.wikipedia.org/>.
+  }
+
+  SERVICE wikibase:label {
+    bd:serviceParam wikibase:language "en".
+  }
+}
 ORDER BY DESC(?sitelinks)
 LIMIT %s
 OFFSET %s
@@ -38,46 +63,46 @@ HEADERS = {
 
 # ── Balance config ────────────────────────────────────────────────────────────
 
-MAX_POIS_PER_COUNTRY = 100
+MAX_POIS_PER_COUNTRY = 235
 
 CATEGORY_COUNTRY_CAPS = {
-    "airports":              4,
-    "peaks":                 4,
-    "volcanoes":             3,
+    "airports":              5,
+    "peaks":                10,
+    "volcanoes":             5,
     "deserts":               5,
-    "oceans":                2,
-    "seas":                  3,
-    "rivers":                4,
-    "lakes":                 4,
-    "waterfalls":            4,
-    "islands":               6,
-    "glaciers":              6,
-    "natural":               4,
-    "national_parks":        8,
-    "cities":               10,
-    "landmarks":            15,
-    "skyscrapers":          15,
-    "bridges":               8,
-    "castles":              12,
-    "stadiums":              8,
+    "oceans":                0,
+    "seas":                  0,
+    "rivers":               10,
+    "lakes":                10,
+    "waterfalls":           10,
+    "islands":              10,
+    "glaciers":              5,
+    "natural":              10,
+    "national_parks":       15,
+    "cities":               20,
+    "landmarks":            30,
+    "skyscrapers":          10,
+    "bridges":              10,
+    "castles":               5,
+    "stadiums":              0,
     "universities":         10,
-    "museums":              12,
-    "infrastructure":        5,
-    "space":                10,
+    "museums":               0,
+    "infrastructure":        0,
+    "space":                 5,
     "markets":               5,
-    "history_and_mysteries": 15,
+    "history_and_mysteries": 25,
 }
 
 DEFAULT_CATEGORY_COUNTRY_CAP = 4
 
-FETCH_LIMIT    = 200
-REQUEST_DELAY  = 4
+FETCH_LIMIT   = 100
+REQUEST_DELAY = 8
 
 # ── Checkpoint config ─────────────────────────────────────────────────────────
 
 CHECKPOINT_DIR  = Path("data/checkpoint")
-CHECKPOINT_ROWS = CHECKPOINT_DIR / "rows.csv"        # all accepted rows so far
-CHECKPOINT_META = CHECKPOINT_DIR / "meta.json"       # counters + completed categories
+CHECKPOINT_ROWS = CHECKPOINT_DIR / "rows.csv"
+CHECKPOINT_META = CHECKPOINT_DIR / "meta.json"
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -85,10 +110,8 @@ CHECKPOINT_META = CHECKPOINT_DIR / "meta.json"       # counters + completed cate
 def save_checkpoint(all_rows, country_total, country_category, seen_ids, completed_categories):
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Save rows
     pd.DataFrame(all_rows).to_csv(CHECKPOINT_ROWS, index=False)
 
-    # Save meta — convert defaultdicts to plain dicts for JSON serialisation
     meta = {
         "completed_categories": list(completed_categories),
         "seen_ids":             list(seen_ids),
@@ -103,10 +126,6 @@ def save_checkpoint(all_rows, country_total, country_category, seen_ids, complet
 
 
 def load_checkpoint():
-    """
-    Returns (all_rows, country_total, country_category, seen_ids, completed_categories)
-    or None if no checkpoint exists.
-    """
     if not CHECKPOINT_ROWS.exists() or not CHECKPOINT_META.exists():
         return None
 
@@ -177,6 +196,11 @@ def parse_results(data, category):
         country = item.get("countryLabel", {}).get("value") or "Unknown"
         if country.startswith("Q") and country[1:].isdigit():
             country = "Unknown"
+
+        # TEMPORARY: USA only
+        if country != "United States":
+            continue
+
         rows.append({
             "wikidata_id":   item.get("place", {}).get("value", "").split("/")[-1],
             "name":          item.get("placeLabel", {}).get("value"),
@@ -219,7 +243,6 @@ def main():
     # ── Category loop ─────────────────────────────────────────────────────────
     for category in active_categories:
 
-        # Skip already-completed categories
         if category in completed_categories:
             print(f"  Skipping {category} (already completed in checkpoint)")
             continue
@@ -237,7 +260,11 @@ def main():
 
         try:
             while collected < target_count:
-                query = QUERY_TEMPLATE % (qid, FETCH_LIMIT, offset)
+                # Use the lightweight peaks query for peaks category
+                if category == "peaks":
+                    query = PEAKS_QUERY_TEMPLATE % (FETCH_LIMIT, offset)
+                else:
+                    query = QUERY_TEMPLATE % (qid, FETCH_LIMIT, offset)
 
                 try:
                     data = run_query(query)
@@ -274,7 +301,7 @@ def main():
 
                     # ✓ Accept
                     seen_ids.add(wid)
-                    country_total[country]             += 1
+                    country_total[country]              += 1
                     country_category[country][category] += 1
                     all_rows.append(row)
                     collected          += 1
@@ -291,7 +318,6 @@ def main():
                 sleep(REQUEST_DELAY)
 
         except KeyboardInterrupt:
-            # Ctrl+C pressed mid-category — save what we have and exit cleanly
             print(f"\n\nInterrupted during '{category}' at offset {offset}.")
             print(f"Saving checkpoint with {len(all_rows)} rows collected so far...")
             save_checkpoint(all_rows, country_total, country_category,
@@ -322,7 +348,6 @@ def main():
     output = "data/raw/wikidata_pois_images_only.csv"
     df.to_csv(output, index=False)
 
-    # Clear checkpoint now that final file is written
     clear_checkpoint()
 
     # ── Final report ──────────────────────────────────────────────────────────
